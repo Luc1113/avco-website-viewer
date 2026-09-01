@@ -1,0 +1,19 @@
+#!/bin/bash
+# Runs after the app is copied into place by the .pkg. Drops a shortcut
+# (symlink) to the installed app on the current GUI user's Desktop.
+set -e
+
+TARGET_ROOT="$2"
+APP_PATH="$TARGET_ROOT/Applications/AVCO Website Viewer.app"
+
+REAL_USER=$(stat -f%Su /dev/console)
+USER_HOME=$(dscl . -read "/Users/$REAL_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+[ -z "$USER_HOME" ] && USER_HOME="$HOME"
+DESKTOP="$USER_HOME/Desktop"
+
+if [ -d "$APP_PATH" ] && [ -d "$DESKTOP" ]; then
+  ln -sf "$APP_PATH" "$DESKTOP/AVCO Website Viewer"
+  chown -h "$REAL_USER" "$DESKTOP/AVCO Website Viewer" 2>/dev/null || true
+fi
+
+exit 0
