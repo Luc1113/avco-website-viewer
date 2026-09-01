@@ -14,7 +14,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,6 +31,219 @@ FAILURES: dict[str, dict] = {}
 BUILDS: dict[str, dict] = {}
 PREFLIGHTS: dict[str, dict] = {}
 LOCK = threading.Lock()
+
+# --- GitHub sign-in / org-repo-branch browser --------------------------------
+
+GITHUB_CLIENT_ID = "Ov23lirZ0powZkv1K4wB"
+GITHUB_STATE_PATH = Path.home() / ".avco-website-viewer-github.json"
+GITHUB_API = "https://api.github.com"
+GITHUB_STATE: dict = {"token": None, "login": None, "org": None}
+GITHUB_ORGS_CACHE: dict = {"time": 0, "orgs": []}
+GITHUB_BRANCH_CACHE: dict[str, dict] = {}
+GITHUB_LOCK = threading.Lock()
+
+
+def load_github_state():
+    global GITHUB_STATE
+    try:
+        GITHUB_STATE.update(json.loads(GITHUB_STATE_PATH.read_text()))
+    except (OSError, ValueError):
+        pass
+
+
+def save_github_state():
+    try:
+        GITHUB_STATE_PATH.write_text(json.dumps(GITHUB_STATE))
+        os.chmod(GITHUB_STATE_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def github_request(url, token=None, method="GET", data=None, form=False, accept="application/vnd.github+json"):
+    headers = {"Accept": accept, "User-Agent": "AVCO-Website-Viewer"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    body = None
+    if data is not None:
+        if form:
+            body = urllib.parse.urlencode(data).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            body = json.dumps(data).encode()
+            headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read().decode()
+            return True, (json.loads(raw) if raw else {}), dict(response.headers)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode())
+        except (ValueError, OSError):
+            detail = {"message": str(exc)}
+        return False, detail, dict(exc.headers or {})
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return False, {"message": str(exc)}, {}
+
+
+def github_start_device_flow():
+    ok, data, _ = github_request(
+        "https://github.com/login/device/code",
+        method="POST",
+        data={"client_id": GITHUB_CLIENT_ID, "scope": "read:org repo"},
+        form=True,
+        accept="application/json",
+    )
+    if not ok or "device_code" not in data:
+        return False, data.get("error_description") or data.get("message") or "Could not start GitHub sign-in.", None
+    subprocess.Popen(["open", data["verification_uri"]])
+    return True, "Opened GitHub in your browser.", data
+
+
+def github_poll_device_flow(device_code):
+    ok, data, _ = github_request(
+        "https://github.com/login/oauth/access_token",
+        method="POST",
+        data={
+            "client_id": GITHUB_CLIENT_ID,
+            "device_code": device_code,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        },
+        form=True,
+        accept="application/json",
+    )
+    error = data.get("error")
+    if error in ("authorization_pending", "slow_down"):
+        return {"pending": True}
+    if error:
+        return {"pending": False, "error": data.get("error_description") or error}
+    token = data.get("access_token")
+    if not token:
+        return {"pending": False, "error": "GitHub did not return an access token."}
+    ok, user, _ = github_request(f"{GITHUB_API}/user", token=token)
+    if not ok:
+        return {"pending": False, "error": "Signed in, but could not read your GitHub profile."}
+    with GITHUB_LOCK:
+        GITHUB_STATE["token"] = token
+        GITHUB_STATE["login"] = user.get("login")
+        GITHUB_STATE["org"] = None
+        save_github_state()
+        GITHUB_ORGS_CACHE.update({"time": 0, "orgs": []})
+    return {"pending": False, "login": user.get("login")}
+
+
+def github_orgs(force=False):
+    token = GITHUB_STATE.get("token")
+    if not token:
+        return []
+    if not force and time.time() - GITHUB_ORGS_CACHE["time"] < 300:
+        return GITHUB_ORGS_CACHE["orgs"]
+    ok, data, _ = github_request(f"{GITHUB_API}/user/orgs?per_page=100", token=token)
+    orgs = [item["login"] for item in data] if ok and isinstance(data, list) else []
+    GITHUB_ORGS_CACHE.update({"time": time.time(), "orgs": orgs})
+    return orgs
+
+
+def github_repos(org, token):
+    ok, data, _ = github_request(f"{GITHUB_API}/orgs/{org}/repos?per_page=100&sort=pushed", token=token)
+    if not ok or not isinstance(data, list):
+        return False, data.get("message", "Could not load repositories."), []
+    repos = [
+        {
+            "name": item["name"],
+            "full_name": item["full_name"],
+            "default_branch": item.get("default_branch", "main"),
+            "private": item.get("private", False),
+            "pushed_at": item.get("pushed_at"),
+            "html_url": item.get("html_url"),
+        }
+        for item in data
+    ]
+    return True, "", repos
+
+
+def github_branches(owner, repo, token):
+    key = f"{owner}/{repo}"
+    cached = GITHUB_BRANCH_CACHE.get(key)
+    if cached and time.time() - cached["time"] < 60:
+        return True, "", cached["branches"]
+    ok, data, _ = github_request(f"{GITHUB_API}/repos/{owner}/{repo}/branches?per_page=100", token=token)
+    if not ok or not isinstance(data, list):
+        return False, data.get("message", "Could not load branches."), []
+    branches = [
+        {"name": item["name"], "sha": item.get("commit", {}).get("sha", "")[:7]}
+        for item in data
+    ]
+    GITHUB_BRANCH_CACHE[key] = {"time": time.time(), "branches": branches}
+    return True, "", branches
+
+
+def local_git_repos():
+    entries = []
+    try:
+        candidates = sorted(
+            (item for item in ROOT.iterdir() if item.is_dir() and (item / ".git").exists()),
+            key=lambda item: item.name.lower(),
+        )
+    except OSError:
+        candidates = []
+    for folder in candidates:
+        branch = git_command(folder, ["branch", "--show-current"]).stdout.strip()
+        status = git_command(folder, ["status", "--porcelain"])
+        dirty = len([line for line in status.stdout.splitlines() if line.strip()])
+        upstream_result = git_command(folder, ["rev-parse", "--verify", "@{u}"])
+        upstream = upstream_result.stdout.strip() if upstream_result.returncode == 0 else ""
+        ahead = behind = 0
+        remote_url = git_command(folder, ["remote", "get-url", "origin"]).stdout.strip()
+        if upstream:
+            counts = git_command(folder, ["rev-list", "--left-right", "--count", f"HEAD...{upstream}"])
+            if counts.returncode == 0 and counts.stdout.strip():
+                parts = counts.stdout.strip().split()
+                if len(parts) == 2:
+                    ahead, behind = int(parts[0]), int(parts[1])
+        entries.append({
+            "key": str(folder),
+            "name": folder.name,
+            "branch": branch or "(detached)",
+            "dirty": dirty,
+            "ahead": ahead,
+            "behind": behind,
+            "remote": remote_url,
+        })
+    return entries
+
+
+def github_clone_or_checkout(owner, repo, branch, token):
+    dest = ROOT / repo
+    remote_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    if dest.exists():
+        if not (dest / ".git").exists():
+            return False, f"{dest} already exists and is not a Git repository."
+        fetched = subprocess.run(
+            ["git", "fetch", remote_url, branch],
+            cwd=dest, capture_output=True, text=True, timeout=180, env=environment,
+        )
+        if fetched.returncode != 0:
+            return False, (fetched.stderr.strip().splitlines() or ["Fetch failed."])[-1]
+        checkout = subprocess.run(
+            ["git", "checkout", "-B", branch, "FETCH_HEAD"],
+            cwd=dest, capture_output=True, text=True, timeout=60, env=environment,
+        )
+        if checkout.returncode != 0:
+            return False, (checkout.stderr.strip().splitlines() or ["Checkout failed."])[-1]
+        subprocess.run(["git", "branch", f"--set-upstream-to=origin/{branch}", branch], cwd=dest, capture_output=True, text=True, env=environment)
+        subprocess.run(["git", "remote", "set-url", "origin", f"https://github.com/{owner}/{repo}.git"], cwd=dest, capture_output=True, text=True, env=environment)
+        return True, f"{repo} is now on branch {branch}."
+    clone = subprocess.run(
+        ["git", "clone", "--branch", branch, remote_url, str(dest)],
+        capture_output=True, text=True, timeout=300, env=environment,
+    )
+    if clone.returncode != 0:
+        return False, (clone.stderr.strip().splitlines() or ["Clone failed."])[-1]
+    subprocess.run(["git", "remote", "set-url", "origin", f"https://github.com/{owner}/{repo}.git"], cwd=dest, capture_output=True, text=True, env=environment)
+    return True, f"Cloned {repo} ({branch}) into {dest}."
 
 
 def load_settings():
@@ -168,6 +383,15 @@ def valid_project(raw_path: str):
     if folder != ROOT and folder.parent != ROOT:
         return None
     return folder if project_command(folder) else None
+
+
+def valid_git_folder(raw_path: str):
+    """Like valid_project, but for the GitHub Local/Pushed tabs: any Git
+    checkout directly under ROOT counts, even without a runnable dev command."""
+    folder = Path(raw_path).resolve()
+    if folder.parent != ROOT:
+        return None
+    return folder if (folder / ".git").exists() else None
 
 
 def start_project(folder: Path, port_attempt: int = 0):
@@ -486,12 +710,38 @@ h2 { font-size:19px; font-weight:600; line-height:1.2; margin:0; letter-spacing:
 .toast.show { opacity:1; transform:none; }
 .modal-backdrop{display:none;position:fixed;inset:0;z-index:20;background:#000c;backdrop-filter:blur(8px);padding:24px;align-items:center;justify-content:center}.modal-backdrop.active{display:flex}.modal{width:min(560px,100%);border-radius:14px;border:1px solid var(--line);background:var(--paper);padding:28px;box-shadow:0 35px 100px #000}.modal h2{font-family:"Poppins",Arial,sans-serif;font-size:26px;font-weight:700;margin:0 0 8px}.modal p{color:var(--muted)}.commit-message{width:100%;height:48px;border-radius:8px;border:1px solid var(--line);background:var(--deep);color:var(--ink);padding:0 14px;font:15px "Lora",Georgia,serif;margin:12px 0 18px}.settings-label{display:block;font:600 12px "Poppins",Arial,sans-serif;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}
 .modal-actions{display:flex;justify-content:flex-end;gap:8px}.cancel{background:#16321f;color:var(--ink);border:1px solid var(--line)}.safety-check{background:var(--accent);color:var(--deep)}.confirm-stage{display:none}.confirm-stage.active{display:block}.compose-stage.hidden{display:none}.warning-title{color:#ffb2b8;text-align:center;font-size:23px!important;text-transform:uppercase;letter-spacing:.02em}.push-summary{padding:14px;border-radius:8px;background:var(--deep);border:1px solid var(--line);margin:16px 0;color:var(--ink);font-family:"Lora",Georgia,serif}.hold-push{position:relative;width:100%;height:66px;border-radius:10px;overflow:hidden;background:#7a1f28;color:white;font-size:16px;letter-spacing:.02em;user-select:none;-webkit-user-select:none}.hold-push .hold-progress{position:absolute;inset:0 auto 0 0;width:0;background:#a5202d;pointer-events:none}.hold-push .hold-label{position:relative;z-index:1}.hold-push.holding{transform:scale(.99)}
-.logs-panel { display:none; }.logs-panel.active { display:block; }.grid.hidden,.filters.hidden{display:none}.console-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:14px}.console-head h2{font-size:20px;font-weight:700}.console-status{color:var(--accent);font-size:13px;font-family:"Lora",Georgia,serif;font-style:italic}.console-actions{display:flex;gap:8px}.log-card{background:var(--paper);border:1px solid #6b3238;border-radius:10px;padding:22px;margin-bottom:14px}.log-card h2{color:#ffd4d7;margin-bottom:6px}.log-error{color:#ff9ca6;font-weight:600;margin-bottom:14px;font-family:"Lora",Georgia,serif}.log-output{margin:0;height:min(55vh,520px);overflow:auto;padding:18px;border-radius:8px;background:var(--deep);border:1px solid var(--line);color:#bfe8c4;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}.logs-empty{color:var(--muted);padding:40px;text-align:center;border:1px dashed var(--line);border-radius:10px;font-style:italic}
+.logs-panel { display:none; }.logs-panel.active { display:block; }.grid.hidden,.filters.hidden{display:none}
+.gh-panel{display:none}.gh-panel.active{display:block}
+.gh-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;flex-wrap:wrap}
+.gh-head h2{font-size:20px;font-weight:700;margin:0}
+.gh-who{color:var(--muted);font-size:13px;font-family:"Lora",Georgia,serif;font-style:italic}
+.gh-tabs{display:flex;gap:8px;margin-bottom:16px}
+.gh-tab{background:var(--paper);color:var(--ink);border:1px solid var(--line);padding:12px 22px;font:700 13px "Poppins",Arial,sans-serif;letter-spacing:.08em;text-transform:uppercase;border-radius:8px}
+.gh-tab.active{background:var(--accent);color:var(--deep);border-color:var(--accent)}
+.gh-table{display:flex;flex-direction:column;gap:10px}
+.gh-row{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.gh-row-top{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.gh-row-name{font:600 16px "Poppins",Arial,sans-serif}
+.gh-row-meta{color:var(--muted);font-size:12px;margin-top:4px}
+.gh-row-actions{display:flex;gap:8px;flex-wrap:wrap}
+.gh-badge{background:#16321f;border:1px solid var(--line);color:var(--muted);border-radius:5px;padding:3px 9px;font-size:11px;font-weight:600}
+.gh-badge.dirty{color:#ffd9d9;background:#3a1c1f;border-color:#6b3238}
+.gh-badge.ahead{color:var(--deep);background:var(--accent);border-color:var(--accent)}
+.gh-branches{margin-top:12px;display:none;flex-direction:column;gap:6px;border-top:1px solid var(--line);padding-top:12px}
+.gh-branches.open{display:flex}
+.gh-branch-row{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px}
+.gh-branch-row span{color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.device-code{font:800 40px "Poppins",Arial,sans-serif;letter-spacing:.12em;text-align:center;background:var(--deep);border:1px solid var(--line);border-radius:10px;padding:20px;margin:16px 0;color:var(--lime)}
+.org-list{display:flex;flex-direction:column;gap:8px;max-height:320px;overflow:auto;margin:16px 0}
+.org-item{background:var(--deep);border:1px solid var(--line);border-radius:8px;padding:12px 16px;text-align:left;color:var(--ink);font:600 15px "Poppins",Arial,sans-serif}
+.org-item:hover{border-color:var(--accent)}.console-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:14px}.console-head h2{font-size:20px;font-weight:700}.console-status{color:var(--accent);font-size:13px;font-family:"Lora",Georgia,serif;font-style:italic}.console-actions{display:flex;gap:8px}.log-card{background:var(--paper);border:1px solid #6b3238;border-radius:10px;padding:22px;margin-bottom:14px}.log-card h2{color:#ffd4d7;margin-bottom:6px}.log-error{color:#ff9ca6;font-weight:600;margin-bottom:14px;font-family:"Lora",Georgia,serif}.log-output{margin:0;height:min(55vh,520px);overflow:auto;padding:18px;border-radius:8px;background:var(--deep);border:1px solid var(--line);color:#bfe8c4;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}.logs-empty{color:var(--muted);padding:40px;text-align:center;border:1px dashed var(--line);border-radius:10px;font-style:italic}
 @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 .card:nth-child(1){animation-delay:.02s}.card:nth-child(2){animation-delay:.06s}.card:nth-child(3){animation-delay:.1s}.card:nth-child(4){animation-delay:.14s}.card:nth-child(5){animation-delay:.18s}.card:nth-child(6){animation-delay:.22s}
 @media(max-width:720px){ main{padding-top:20px}.nav{padding-bottom:24px}header{grid-template-columns:1fr;padding-bottom:26px}.stats{margin-top:10px}.toolbar{gap:12px;align-items:flex-start}.toolbar-actions{flex-wrap:wrap;justify-content:flex-end}.filters{grid-template-columns:1fr}.refresh{padding-inline:14px}.grid{grid-template-columns:1fr} }
 </style></head>
-<body><main><nav class="nav"><div class="brand"><div class="mark">AVCO</div><span>Website Operations</span></div><div class="nav-status"><i class="pulse"></i>Local workspace connected</div></nav><header><div><div class="eyebrow">Development command center</div><h1>Website Viewer</h1><p class="sub">Build, launch, update, and inspect every AVCO website from one focused workspace.</p></div><div class="stats"><div class="stat"><strong id="total">–</strong><span>Projects</span></div><div class="stat"><strong id="live">–</strong><span>Live</span></div><div class="stat"><strong id="npm">–</strong><span>npm</span></div></div></header><div class="toolbar"><h3>Projects in <span id="rootLabel">__ROOT__</span></h3><div class="toolbar-actions"><button id="settingsTab" class="logs-tab" onclick="openSettings()" aria-label="Settings">⚙ Settings</button><button id="logsTab" class="logs-tab" onclick="showLogs()">Build console</button><button class="refresh" onclick="load()">Refresh</button></div></div><div id="filters" class="filters"><label class="search-wrap"><input id="search" class="search" type="search" placeholder="Search websites…" oninput="renderProjects()" aria-label="Search websites"></label><select id="sort" class="sort" onchange="renderProjects()" aria-label="Sort websites"><option value="recent">Recently changed</option><option value="alpha">Alphabetical A–Z</option><option value="live">Live websites first</option><option value="type">Website type</option></select></div><section id="grid" class="grid"></section><section id="logsPanel" class="logs-panel"></section></main><div class="toast" id="toast"></div><div id="pushModal" class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal"><div id="composeStage" class="compose-stage"><h2>Commit & Push</h2><p id="pushProject"></p><input id="commitMessage" class="commit-message" placeholder="Describe your changes…" maxlength="180"><div class="modal-actions"><button class="cancel" onclick="closePushModal()">Cancel</button><button id="checkPush" class="safety-check" onclick="checkPushSafety()">Check remote safety</button></div></div><div id="confirmStage" class="confirm-stage"><h2 class="warning-title">Are you sure you would like to push?</h2><div id="pushSummary" class="push-summary"></div><p style="text-align:center">Hold the red button continuously for three seconds. Releasing early cancels the push.</p><button id="holdPush" class="hold-push"><span class="hold-progress"></span><span class="hold-label">YES — HOLD 3 SECONDS TO PUSH</span></button><div class="modal-actions" style="margin-top:12px"><button class="cancel" onclick="closePushModal()">Cancel</button></div></div></div></div><div id="settingsModal" class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal"><h2>Settings</h2><p>Choose which folder Website Viewer scans, and how often the dashboard refreshes.</p><label class="settings-label" for="rootInput">Website folder</label><input id="rootInput" class="commit-message" placeholder="/Users/you/avco"><label class="settings-label" for="refreshInput">Auto-refresh</label><select id="refreshInput" class="sort" style="width:100%;margin:0 0 16px"><option value="5000">Every 5 seconds</option><option value="10000">Every 10 seconds</option><option value="30000">Every 30 seconds</option><option value="60000">Every minute</option><option value="0">Off</option></select><div class="modal-actions"><button class="cancel" onclick="closeSettings()">Cancel</button><button class="safety-check" onclick="saveSettings()">Save</button></div></div></div>
+<body><main><nav class="nav"><div class="brand"><div class="mark">AVCO</div><span>Website Operations</span></div><div class="nav-status"><i class="pulse"></i>Local workspace connected</div></nav><header><div><div class="eyebrow">Development command center</div><h1>Website Viewer</h1><p class="sub">Build, launch, update, and inspect every AVCO website from one focused workspace.</p></div><div class="stats"><div class="stat"><strong id="total">–</strong><span>Projects</span></div><div class="stat"><strong id="live">–</strong><span>Live</span></div><div class="stat"><strong id="npm">–</strong><span>npm</span></div></div></header><div class="toolbar"><h3>Projects in <span id="rootLabel">__ROOT__</span></h3><div class="toolbar-actions"><button id="githubTab" class="logs-tab" onclick="showGithub()">⇄ GitHub</button><button id="settingsTab" class="logs-tab" onclick="openSettings()" aria-label="Settings">⚙ Settings</button><button id="logsTab" class="logs-tab" onclick="showLogs()">Build console</button><button class="refresh" onclick="load()">Refresh</button></div></div><div id="filters" class="filters"><label class="search-wrap"><input id="search" class="search" type="search" placeholder="Search websites…" oninput="renderProjects()" aria-label="Search websites"></label><select id="sort" class="sort" onchange="renderProjects()" aria-label="Sort websites"><option value="recent">Recently changed</option><option value="alpha">Alphabetical A–Z</option><option value="live">Live websites first</option><option value="type">Website type</option></select></div><section id="grid" class="grid"></section><section id="logsPanel" class="logs-panel"></section><section id="ghPanel" class="gh-panel"><div class="gh-head"><div><h2>GitHub</h2><div id="ghWho" class="gh-who">Not signed in</div></div><div class="toolbar-actions"><button id="ghOrgBtn" class="logs-tab" style="display:none" onclick="openOrgPicker()">Switch organization</button><button id="ghSignBtn" class="refresh" onclick="startSignIn()">Sign in with GitHub</button><button onclick="showProjects()">← Projects</button></div></div><div id="ghTabs" class="gh-tabs" style="display:none"><button id="ghTabLocal" class="gh-tab active" onclick="setGhTab('local')">Local</button><button id="ghTabPushed" class="gh-tab" onclick="setGhTab('pushed')">Pushed</button></div><div id="ghLocalTable" class="gh-table"></div><div id="ghPushedTable" class="gh-table" style="display:none"></div></section></main><div class="toast" id="toast"></div>
+<div id="deviceModal" class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal"><h2>Sign in with GitHub</h2><p id="deviceIntro">Opening GitHub in your browser…</p><div id="deviceCode" class="device-code" style="display:none"></div><p id="deviceStatus" style="text-align:center;color:var(--muted)"></p><div class="modal-actions"><button class="cancel" onclick="closeDeviceModal()">Cancel</button></div></div></div>
+<div id="orgModal" class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal"><h2>Choose an organization</h2><p>Pick the GitHub organization to browse.</p><div id="orgList" class="org-list"></div><div class="modal-actions"><button class="cancel" onclick="closeOrgPicker()">Cancel</button></div></div></div><div id="pushModal" class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal"><div id="composeStage" class="compose-stage"><h2>Commit & Push</h2><p id="pushProject"></p><input id="commitMessage" class="commit-message" placeholder="Describe your changes…" maxlength="180"><div class="modal-actions"><button class="cancel" onclick="closePushModal()">Cancel</button><button id="checkPush" class="safety-check" onclick="checkPushSafety()">Check remote safety</button></div></div><div id="confirmStage" class="confirm-stage"><h2 class="warning-title">Are you sure you would like to push?</h2><div id="pushSummary" class="push-summary"></div><p style="text-align:center">Hold the red button continuously for three seconds. Releasing early cancels the push.</p><button id="holdPush" class="hold-push"><span class="hold-progress"></span><span class="hold-label">YES — HOLD 3 SECONDS TO PUSH</span></button><div class="modal-actions" style="margin-top:12px"><button class="cancel" onclick="closePushModal()">Cancel</button></div></div></div></div><div id="settingsModal" class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal"><h2>Settings</h2><p>Choose which folder Website Viewer scans, and how often the dashboard refreshes.</p><label class="settings-label" for="rootInput">Website folder</label><input id="rootInput" class="commit-message" placeholder="/Users/you/avco"><label class="settings-label" for="refreshInput">Auto-refresh</label><select id="refreshInput" class="sort" style="width:100%;margin:0 0 16px"><option value="5000">Every 5 seconds</option><option value="10000">Every 10 seconds</option><option value="30000">Every 30 seconds</option><option value="60000">Every minute</option><option value="0">Off</option></select><div class="modal-actions"><button class="cancel" onclick="closeSettings()">Cancel</button><button class="safety-check" onclick="saveSettings()">Save</button></div></div></div>
 <script>
 const grid=document.querySelector('#grid'), toast=document.querySelector('#toast'), logsPanel=document.querySelector('#logsPanel'), logsTab=document.querySelector('#logsTab');let latestProjects=[];
 function safe(s){const e=document.createElement('span');e.textContent=s;return e.innerHTML}
@@ -523,21 +773,21 @@ function renderProjects(){
  for(const [key,card] of existing)if(!wanted.has(key))card.remove();
  grid.dataset.ready='1';
 }
-function showProjects(){logsPanel.classList.remove('active');grid.classList.remove('hidden');document.querySelector('#filters').classList.remove('hidden');logsTab.classList.remove('active')}
-async function showLogs(focusKey=''){grid.classList.add('hidden');document.querySelector('#filters').classList.add('hidden');logsPanel.classList.add('active');logsTab.classList.add('active');const failures=latestProjects.filter(p=>p.error);if(!failures.length){logsPanel.innerHTML='<div class="logs-empty">No build failures are currently recorded.</div>';return}logsPanel.innerHTML='<div class="logs-empty">Loading build logs…</div>';const cards=[];for(const p of failures){const key=encodeURIComponent(p.key);const response=await fetch('/api/logs?path='+key).then(r=>r.json());cards.push(`<article class="log-card" id="log-${key}"><h2>${safe(p.name)}</h2><div class="log-error">${safe(p.error)}</div><pre class="log-output">${safe(response.log)}</pre></article>`)}logsPanel.innerHTML=cards.join('');if(focusKey)document.querySelector('#log-'+CSS.escape(focusKey))?.scrollIntoView({behavior:'smooth'})}
+function showProjects(){logsPanel.classList.remove('active');document.querySelector('#ghPanel').classList.remove('active');grid.classList.remove('hidden');document.querySelector('#filters').classList.remove('hidden');logsTab.classList.remove('active');stopGhRefresh()}
+async function showLogs(focusKey=''){document.querySelector('#ghPanel').classList.remove('active');stopGhRefresh();grid.classList.add('hidden');document.querySelector('#filters').classList.add('hidden');logsPanel.classList.add('active');logsTab.classList.add('active');const failures=latestProjects.filter(p=>p.error);if(!failures.length){logsPanel.innerHTML='<div class="logs-empty">No build failures are currently recorded.</div>';return}logsPanel.innerHTML='<div class="logs-empty">Loading build logs…</div>';const cards=[];for(const p of failures){const key=encodeURIComponent(p.key);const response=await fetch('/api/logs?path='+key).then(r=>r.json());cards.push(`<article class="log-card" id="log-${key}"><h2>${safe(p.name)}</h2><div class="log-error">${safe(p.error)}</div><pre class="log-output">${safe(response.log)}</pre></article>`)}logsPanel.innerHTML=cards.join('');if(focusKey)document.querySelector('#log-'+CSS.escape(focusKey))?.scrollIntoView({behavior:'smooth'})}
 async function showBuildConsole(key){grid.classList.add('hidden');document.querySelector('#filters').classList.add('hidden');logsPanel.classList.add('active');logsTab.classList.add('active');const project=latestProjects.find(p=>encodeURIComponent(p.key)===key);logsPanel.innerHTML=`<div class="console-head"><div><h2>${safe(project?.name||'Website build')}</h2><div id="consoleStatus" class="console-status">Preparing build…</div></div><div class="console-actions"><button onclick="showProjects()">← Projects</button></div></div><pre id="liveOutput" class="log-output">Starting build process…</pre>`;await pollBuild(key)}
 async function pollBuild(key){const result=await fetch('/api/build-status?path='+key).then(r=>r.json()),output=document.querySelector('#liveOutput'),status=document.querySelector('#consoleStatus');if(!output)return;output.textContent=result.log;output.scrollTop=output.scrollHeight;status.textContent=result.status==='running'?'● Build running…':result.status==='complete'?'✓ Website is live':`! ${result.message}`;if(result.status==='running'){setTimeout(()=>pollBuild(key),450)}else{await load();if(result.status==='complete'&&result.url){document.querySelector('.console-actions')?.insertAdjacentHTML('afterbegin',`<a class="button open" href="${result.url}" target="_blank">Open ${result.url} ↗</a>`)}}}
 async function runSite(key,button){button.disabled=true;button.textContent='Opening console…';const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+key}).then(r=>r.json());if(r.error){note(r.error);button.disabled=false}else{showBuildConsole(key)}}
 async function stopSite(key){await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+key});note('Website stopped');await load()}
 async function closeAllSites(){const r=await fetch('/api/stop-all',{method:'POST'}).then(r=>r.json());note(r.count?`Closed ${r.count} website${r.count===1?'':'s'}`:'No websites are currently running');showProjects();await load()}
-async function pullSite(key,button){const old=button.textContent;button.disabled=true;button.textContent='Pulling…';const r=await fetch('/api/pull',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+key}).then(r=>r.json());note(r.message);button.disabled=false;button.textContent=old}
-let pushKey='',pushToken='',holdStart=0,holdFrame=0,pushing=false;
-function openPushModal(key){pushKey=key;pushToken='';pushing=false;const p=latestProjects.find(item=>encodeURIComponent(item.key)===key);document.querySelector('#pushProject').textContent=`${p?.name||'Website'} — all current changes will be staged.`;document.querySelector('#commitMessage').value='';document.querySelector('#composeStage').classList.remove('hidden');document.querySelector('#confirmStage').classList.remove('active');document.querySelector('#pushModal').classList.add('active');setTimeout(()=>document.querySelector('#commitMessage').focus(),80)}
+async function pullSite(key,button,prefix='/api'){const old=button.textContent;button.disabled=true;button.textContent='Pulling…';const r=await fetch(prefix+'/pull',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+key}).then(r=>r.json());note(r.message);button.disabled=false;button.textContent=old;if(prefix!=='/api')loadGhLocal()}
+let pushKey='',pushToken='',pushPrefix='/api',holdStart=0,holdFrame=0,pushing=false;
+function openPushModal(key,prefix='/api'){pushKey=key;pushToken='';pushing=false;pushPrefix=prefix;const p=latestProjects.find(item=>encodeURIComponent(item.key)===key)||ghLocalRepos.find(item=>encodeURIComponent(item.key)===key);document.querySelector('#pushProject').textContent=`${p?.name||'Website'} — all current changes will be staged.`;document.querySelector('#commitMessage').value='';document.querySelector('#composeStage').classList.remove('hidden');document.querySelector('#confirmStage').classList.remove('active');document.querySelector('#pushModal').classList.add('active');setTimeout(()=>document.querySelector('#commitMessage').focus(),80)}
 function closePushModal(){if(pushing)return;cancelHold();document.querySelector('#pushModal').classList.remove('active')}
-async function checkPushSafety(){const message=document.querySelector('#commitMessage').value.trim(),button=document.querySelector('#checkPush');if(!message){note('Enter a commit message first');return}button.disabled=true;button.textContent='Checking remote…';const response=await fetch('/api/push-preflight',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+pushKey}).then(async r=>({ok:r.ok,data:await r.json()}));button.disabled=false;button.textContent='Check remote safety';if(!response.ok){note(response.data.message);return}pushToken=response.data.details.token;const d=response.data.details;document.querySelector('#pushSummary').textContent=`Safety check passed · ${d.changed} changed file${d.changed===1?'':'s'} · ${d.ahead} local commit${d.ahead===1?'':'s'} ahead · branch ${d.branch}`;document.querySelector('#composeStage').classList.add('hidden');document.querySelector('#confirmStage').classList.add('active')}
+async function checkPushSafety(){const message=document.querySelector('#commitMessage').value.trim(),button=document.querySelector('#checkPush');if(!message){note('Enter a commit message first');return}button.disabled=true;button.textContent='Checking remote…';const response=await fetch(pushPrefix+'/push-preflight',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+pushKey}).then(async r=>({ok:r.ok,data:await r.json()}));button.disabled=false;button.textContent='Check remote safety';if(!response.ok){note(response.data.message);return}pushToken=response.data.details.token;const d=response.data.details;document.querySelector('#pushSummary').textContent=`Safety check passed · ${d.changed} changed file${d.changed===1?'':'s'} · ${d.ahead} local commit${d.ahead===1?'':'s'} ahead · branch ${d.branch}`;document.querySelector('#composeStage').classList.add('hidden');document.querySelector('#confirmStage').classList.add('active')}
 function beginHold(event){if(!pushToken||pushing)return;event.preventDefault();const button=document.querySelector('#holdPush');button.classList.add('holding');button.setPointerCapture?.(event.pointerId);holdStart=performance.now();const tick=now=>{const elapsed=now-holdStart,pct=Math.min(100,elapsed/30);button.querySelector('.hold-progress').style.width=pct+'%';button.querySelector('.hold-label').textContent=elapsed>=3000?'PUSHING…':`YES — KEEP HOLDING ${(3-elapsed/1000).toFixed(1)}s`;if(elapsed>=3000){holdFrame=0;commitPush();return}holdFrame=requestAnimationFrame(tick)};holdFrame=requestAnimationFrame(tick)}
 function cancelHold(){if(holdFrame)cancelAnimationFrame(holdFrame);holdFrame=0;holdStart=0;const button=document.querySelector('#holdPush');button.classList.remove('holding');button.querySelector('.hold-progress').style.width='0';button.querySelector('.hold-label').textContent='YES — HOLD 3 SECONDS TO PUSH'}
-async function commitPush(){if(pushing)return;pushing=true;const body=new URLSearchParams({path:pushKey,token:pushToken,message:document.querySelector('#commitMessage').value});const response=await fetch('/api/commit-push',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}).then(async r=>({ok:r.ok,data:await r.json()}));pushing=false;if(response.ok){document.querySelector('#pushModal').classList.remove('active');note(response.data.message);await load()}else{note(response.data.message);closePushModal()}}
+async function commitPush(){if(pushing)return;pushing=true;const body=new URLSearchParams({path:pushKey,token:pushToken,message:document.querySelector('#commitMessage').value});const response=await fetch(pushPrefix+'/commit-push',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}).then(async r=>({ok:r.ok,data:await r.json()}));pushing=false;if(response.ok){document.querySelector('#pushModal').classList.remove('active');note(response.data.message);if(pushPrefix!=='/api')loadGhLocal();else await load()}else{note(response.data.message);closePushModal()}}
 const holdButton=document.querySelector('#holdPush');holdButton.addEventListener('pointerdown',beginHold);holdButton.addEventListener('pointerup',cancelHold);holdButton.addEventListener('pointercancel',cancelHold);holdButton.addEventListener('pointerleave',event=>{if(event.buttons)cancelHold()});
 let currentSettings={root:'',refresh_ms:10000},refreshTimer=0;
 function armRefresh(){if(refreshTimer)clearInterval(refreshTimer);if(currentSettings.refresh_ms>0)refreshTimer=setInterval(load,currentSettings.refresh_ms)}
@@ -545,6 +795,34 @@ async function loadSettings(){currentSettings=await fetch('/api/settings').then(
 function openSettings(){document.querySelector('#rootInput').value=currentSettings.root;document.querySelector('#refreshInput').value=String(currentSettings.refresh_ms);document.querySelector('#settingsModal').classList.add('active')}
 function closeSettings(){document.querySelector('#settingsModal').classList.remove('active')}
 async function saveSettings(){const root=document.querySelector('#rootInput').value.trim(),refresh_ms=Number(document.querySelector('#refreshInput').value);const response=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({root,refresh_ms})}).then(async r=>({ok:r.ok,data:await r.json()}));if(!response.ok){note(response.data.message||'Could not save settings');return}closeSettings();note('Settings saved');await loadSettings();await load()}
+let ghSession={signed_in:false,login:'',org:''},ghLocalRepos=[],ghPushedRepos=[],ghTab='local',ghRefreshTimer=0,deviceCode='',devicePollTimer=0;
+function showGithub(){logsPanel.classList.remove('active');logsTab.classList.remove('active');grid.classList.add('hidden');document.querySelector('#filters').classList.add('hidden');document.querySelector('#ghPanel').classList.add('active');loadGhSession();armGhRefresh()}
+function armGhRefresh(){if(ghRefreshTimer)clearInterval(ghRefreshTimer);ghRefreshTimer=setInterval(()=>{if(!ghSession.signed_in)return;ghTab==='local'?loadGhLocal():loadGhPushed()},60000)}
+function stopGhRefresh(){if(ghRefreshTimer)clearInterval(ghRefreshTimer);ghRefreshTimer=0}
+async function loadGhSession(){ghSession=await fetch('/api/github/session').then(r=>r.json());const who=document.querySelector('#ghWho'),signBtn=document.querySelector('#ghSignBtn'),orgBtn=document.querySelector('#ghOrgBtn'),tabs=document.querySelector('#ghTabs');
+ if(!ghSession.signed_in){who.textContent='Not signed in';signBtn.style.display='';signBtn.textContent='Sign in with GitHub';orgBtn.style.display='none';tabs.style.display='none';document.querySelector('#ghLocalTable').innerHTML='';document.querySelector('#ghPushedTable').innerHTML='';return}
+ signBtn.style.display='none';orgBtn.style.display='';tabs.style.display='';
+ if(!ghSession.org){who.textContent=`Signed in as ${ghSession.login} · choose an organization`;openOrgPicker();return}
+ who.textContent=`Signed in as ${ghSession.login} · org: ${ghSession.org}`;
+ loadGhLocal();loadGhPushed();
+}
+function setGhTab(tab){ghTab=tab;document.querySelector('#ghTabLocal').classList.toggle('active',tab==='local');document.querySelector('#ghTabPushed').classList.toggle('active',tab==='pushed');document.querySelector('#ghLocalTable').style.display=tab==='local'?'':'none';document.querySelector('#ghPushedTable').style.display=tab==='pushed'?'':'none';tab==='local'?loadGhLocal():loadGhPushed()}
+async function loadGhLocal(){ghLocalRepos=await fetch('/api/github/local').then(r=>r.json());const box=document.querySelector('#ghLocalTable');
+ if(!ghLocalRepos.length){box.innerHTML='<div class="empty">No local Git repositories found in this folder yet.</div>';return}
+ box.innerHTML=ghLocalRepos.map(r=>{const key=encodeURIComponent(r.key);return `<div class="gh-row"><div class="gh-row-top"><div><div class="gh-row-name">${safe(r.name)}</div><div class="gh-row-meta">branch ${safe(r.branch)}${r.remote?' · '+safe(r.remote):''}</div></div><div class="gh-row-actions">${r.dirty?`<span class="gh-badge dirty">${r.dirty} uncommitted</span>`:''}${r.ahead?`<span class="gh-badge ahead">${r.ahead} ahead</span>`:''}${r.behind?`<span class="gh-badge">${r.behind} behind</span>`:''}<button class="pull" onclick="pullSite('${key}',this,'/api/github')">↓ Pull</button><button class="push" onclick="openPushModal('${key}','/api/github')">↑ Commit &amp; Push</button></div></div></div>`}).join('')}
+async function loadGhPushed(){const response=await fetch('/api/github/repos').then(r=>r.json());const box=document.querySelector('#ghPushedTable');
+ if(!response.ok){box.innerHTML=`<div class="empty">${safe(response.message||'Could not load repositories.')}</div>`;return}
+ ghPushedRepos=response.repos;
+ if(!ghPushedRepos.length){box.innerHTML='<div class="empty">This organization has no repositories visible to you.</div>';return}
+ box.innerHTML=ghPushedRepos.map(r=>{const rid=r.full_name.replace(/[^a-zA-Z0-9]/g,'_');return `<div class="gh-row"><div class="gh-row-top"><div><div class="gh-row-name">${safe(r.name)}${r.private?' 🔒':''}</div><div class="gh-row-meta">default branch ${safe(r.default_branch)}${r.pushed_at?' · pushed '+new Date(r.pushed_at).toLocaleString():''}</div></div><div class="gh-row-actions"><button class="logs-tab" onclick="toggleGhBranches('${rid}','${safe(r.full_name)}')">Branches</button><button class="pull" onclick="ghClone('${safe(r.full_name)}','${safe(r.default_branch)}',this)">↓ Pull / Clone</button></div></div><div id="branches-${rid}" class="gh-branches"></div></div>`}).join('')}
+async function toggleGhBranches(rid,fullName){const box=document.querySelector('#branches-'+rid);const open=box.classList.toggle('open');if(!open||box.dataset.loaded)return;box.innerHTML='Loading branches…';const response=await fetch('/api/github/branches?repo='+encodeURIComponent(fullName)).then(r=>r.json());if(!response.ok){box.innerHTML=safe(response.message||'Could not load branches.');return}box.dataset.loaded='1';box.innerHTML=response.branches.map(b=>`<div class="gh-branch-row"><span>${safe(b.name)} · ${safe(b.sha)}</span><button class="pull" onclick="ghClone('${safe(fullName)}','${safe(b.name)}',this)">↓ Pull / Clone</button></div>`).join('')}
+async function ghClone(fullName,branch,button){const old=button.textContent;button.disabled=true;button.textContent='Working…';const r=await fetch('/api/github/clone',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({repo:fullName,branch})}).then(r=>r.json());note(r.message);button.disabled=false;button.textContent=old;if(r.ok){loadGhLocal();await load()}}
+function startSignIn(){document.querySelector('#deviceModal').classList.add('active');document.querySelector('#deviceIntro').textContent='Starting sign-in…';document.querySelector('#deviceCode').style.display='none';document.querySelector('#deviceStatus').textContent='';fetch('/api/github/device-code',{method:'POST'}).then(r=>r.json()).then(r=>{if(!r.ok){note(r.message);closeDeviceModal();return}deviceCode=r.data.device_code;document.querySelector('#deviceIntro').textContent='We opened GitHub in your browser. Enter this code there:';const codeBox=document.querySelector('#deviceCode');codeBox.textContent=r.data.user_code;codeBox.style.display='';document.querySelector('#deviceStatus').textContent='Waiting for you to approve on GitHub…';pollDevice(Math.max(r.data.interval||5,5))})}
+function pollDevice(interval){if(devicePollTimer)clearTimeout(devicePollTimer);devicePollTimer=setTimeout(async()=>{const body='device_code='+encodeURIComponent(deviceCode);const result=await fetch('/api/github/poll',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}).then(r=>r.json());if(result.pending){pollDevice(interval);return}if(result.error){document.querySelector('#deviceStatus').textContent=result.error;return}closeDeviceModal();note(`Signed in as ${result.login}`);loadGhSession()},interval*1000)}
+function closeDeviceModal(){if(devicePollTimer)clearTimeout(devicePollTimer);devicePollTimer=0;document.querySelector('#deviceModal').classList.remove('active')}
+async function openOrgPicker(){const response=await fetch('/api/github/orgs').then(r=>r.json());const list=document.querySelector('#orgList');const orgs=response.orgs||[];list.innerHTML=orgs.length?orgs.map(o=>`<button class="org-item" onclick="selectOrg('${safe(o)}')">${safe(o)}</button>`).join(''):'<div class="empty">No organizations found for this account.</div>';document.querySelector('#orgModal').classList.add('active')}
+function closeOrgPicker(){document.querySelector('#orgModal').classList.remove('active')}
+async function selectOrg(org){const r=await fetch('/api/github/select-org',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'org='+encodeURIComponent(org)}).then(r=>r.json());if(!r.ok){note(r.message);return}closeOrgPicker();note(`Browsing ${org}`);loadGhSession()}
 loadSettings(); load();
 </script></body></html>"""
 
@@ -579,6 +857,37 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_content(200, json.dumps(build_status(folder)))
         elif parsed.path == "/api/settings":
             self.send_content(200, json.dumps({"root": str(ROOT), "refresh_ms": REFRESH_MS}))
+        elif parsed.path == "/api/github/session":
+            self.send_content(200, json.dumps({
+                "signed_in": bool(GITHUB_STATE.get("token")),
+                "login": GITHUB_STATE.get("login"),
+                "org": GITHUB_STATE.get("org"),
+            }))
+        elif parsed.path == "/api/github/orgs":
+            if not GITHUB_STATE.get("token"):
+                self.send_content(401, json.dumps({"error": "Not signed in."}))
+            else:
+                self.send_content(200, json.dumps({"orgs": github_orgs()}))
+        elif parsed.path == "/api/github/repos":
+            token = GITHUB_STATE.get("token")
+            org = GITHUB_STATE.get("org")
+            if not token or not org:
+                self.send_content(401, json.dumps({"error": "Sign in and choose an organization first."}))
+            else:
+                ok, message, repos = github_repos(org, token)
+                self.send_content(200 if ok else 400, json.dumps({"ok": ok, "message": message, "repos": repos}))
+        elif parsed.path == "/api/github/branches":
+            data = urllib.parse.parse_qs(parsed.query)
+            token = GITHUB_STATE.get("token")
+            repo = data.get("repo", [""])[0]
+            if not token or not repo or "/" not in repo:
+                self.send_content(400, json.dumps({"ok": False, "message": "Missing repository.", "branches": []}))
+            else:
+                owner, name = repo.split("/", 1)
+                ok, message, branches = github_branches(owner, name, token)
+                self.send_content(200 if ok else 400, json.dumps({"ok": ok, "message": message, "branches": branches}))
+        elif parsed.path == "/api/github/local":
+            self.send_content(200, json.dumps(local_git_repos()))
         elif parsed.path == "/":
             page = PAGE.replace("__ROOT__", html.escape(str(ROOT)))
             self.send_content(200, page, "text/html")
@@ -586,6 +895,68 @@ class Handler(BaseHTTPRequestHandler):
             self.send_content(404, json.dumps({"error": "Not found"}))
 
     def do_POST(self):
+        if self.path == "/api/github/device-code":
+            ok, message, data = github_start_device_flow()
+            self.send_content(200 if ok else 400, json.dumps({"ok": ok, "message": message, "data": data}))
+            return
+        if self.path == "/api/github/poll":
+            length = int(self.headers.get("Content-Length", "0"))
+            data = urllib.parse.parse_qs(self.rfile.read(length).decode())
+            device_code = data.get("device_code", [""])[0]
+            if not device_code:
+                self.send_content(400, json.dumps({"pending": False, "error": "Missing device code."}))
+                return
+            self.send_content(200, json.dumps(github_poll_device_flow(device_code)))
+            return
+        if self.path == "/api/github/select-org":
+            length = int(self.headers.get("Content-Length", "0"))
+            data = urllib.parse.parse_qs(self.rfile.read(length).decode())
+            org = data.get("org", [""])[0].strip()
+            if not org or org not in github_orgs():
+                self.send_content(400, json.dumps({"ok": False, "message": "That organization is not available to you."}))
+                return
+            GITHUB_STATE["org"] = org
+            save_github_state()
+            self.send_content(200, json.dumps({"ok": True, "org": org}))
+            return
+        if self.path == "/api/github/sign-out":
+            GITHUB_STATE.update({"token": None, "login": None, "org": None})
+            save_github_state()
+            self.send_content(200, json.dumps({"ok": True}))
+            return
+        if self.path == "/api/github/clone":
+            length = int(self.headers.get("Content-Length", "0"))
+            data = urllib.parse.parse_qs(self.rfile.read(length).decode())
+            token = GITHUB_STATE.get("token")
+            repo = data.get("repo", [""])[0]
+            branch = data.get("branch", [""])[0].strip()
+            if not token:
+                self.send_content(401, json.dumps({"ok": False, "message": "Sign in to GitHub first."}))
+                return
+            if not repo or "/" not in repo or not branch:
+                self.send_content(400, json.dumps({"ok": False, "message": "Missing repository or branch."}))
+                return
+            owner, name = repo.split("/", 1)
+            ok, message = github_clone_or_checkout(owner, name, branch, token)
+            self.send_content(200 if ok else 400, json.dumps({"ok": ok, "message": message}))
+            return
+        if self.path in ("/api/github/pull", "/api/github/push-preflight", "/api/github/commit-push"):
+            length = int(self.headers.get("Content-Length", "0"))
+            data = urllib.parse.parse_qs(self.rfile.read(length).decode())
+            folder = valid_git_folder(data.get("path", [""])[0])
+            if not folder:
+                self.send_content(400, json.dumps({"ok": False, "message": "That repository is not available."}))
+                return
+            if self.path == "/api/github/pull":
+                ok, message = pull_project(folder)
+                self.send_content(200 if ok else 400, json.dumps({"ok": ok, "message": message}))
+            elif self.path == "/api/github/push-preflight":
+                ok, message, details = push_preflight(folder)
+                self.send_content(200 if ok else 400, json.dumps({"ok": ok, "message": message, "details": details}))
+            else:
+                ok, message = commit_and_push(folder, data.get("token", [""])[0], data.get("message", [""])[0])
+                self.send_content(200 if ok else 400, json.dumps({"ok": ok, "message": message}))
+            return
         if self.path == "/api/stop-all":
             count = stop_all_projects()
             self.send_content(200, json.dumps({"ok": True, "count": count}))
@@ -650,6 +1021,7 @@ def main():
     parser.add_argument("--port", type=int, default=0, help="use a specific dashboard port")
     args = parser.parse_args()
     load_settings()
+    load_github_state()
     if args.check:
         print(json.dumps(discover(), indent=2))
         return

@@ -33,6 +33,17 @@ productbuild --distribution distribution.xml --package-path . --resources . \
 
 If macOS blocks the transferred app, Control-click it and choose **Open** the first time.
 
+## GitHub tab
+
+Click **⇄ GitHub** in the toolbar to sign in with GitHub (device flow — no password typed into the app), pick an organization, and browse it:
+
+- **Local** — every Git repo already checked out in the current folder, with branch, uncommitted-change count, and ahead/behind counts. Pull or Commit & Push directly from here (same safety-checked push flow as the Projects cards).
+- **Pushed** — every repo in the selected GitHub organization, with a Branches list per repo. "Pull / Clone" checks a repo+branch out locally if it isn't already, or fast-forwards it if it is.
+
+Both tabs auto-refresh every 60 seconds while the GitHub panel is open.
+
+Sign-in uses OAuth Device Flow against a public GitHub OAuth App (Client ID `Ov23lirZ0powZkv1K4wB`, no client secret involved — safe to ship in the app). The resulting token is stored at `~/.avco-website-viewer-github.json` (mode 600), never in this repo.
+
 ## Auto-updates
 
 The app checks this GitHub repo's `main` branch for a newer commit every time it launches. If one exists, it downloads it, replaces itself in place, and relaunches — no manual reinstall needed after the first install.
