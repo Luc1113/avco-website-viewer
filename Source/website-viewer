@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -178,8 +179,36 @@ def github_branches(owner, repo, token):
     return True, "", branches
 
 
+def _local_repo_status(folder: Path):
+    # One `status` call gives branch + ahead/behind + dirty count together;
+    # one more gets the remote URL. Two subprocess spawns per repo instead of five.
+    status = git_command(folder, ["status", "--branch", "--porcelain=v2"])
+    branch, ahead, behind, dirty = "(detached)", 0, 0, 0
+    for line in status.stdout.splitlines():
+        if line.startswith("# branch.head "):
+            branch = line.split(" ", 2)[2] or "(detached)"
+        elif line.startswith("# branch.ab "):
+            parts = line.split()
+            try:
+                ahead = int(parts[2].lstrip("+"))
+                behind = int(parts[3].lstrip("-"))
+            except (IndexError, ValueError):
+                pass
+        elif line and not line.startswith("#"):
+            dirty += 1
+    remote_url = git_command(folder, ["remote", "get-url", "origin"]).stdout.strip()
+    return {
+        "key": str(folder),
+        "name": folder.name,
+        "branch": branch,
+        "dirty": dirty,
+        "ahead": ahead,
+        "behind": behind,
+        "remote": remote_url,
+    }
+
+
 def local_git_repos():
-    entries = []
     try:
         candidates = sorted(
             (item for item in ROOT.iterdir() if item.is_dir() and (item / ".git").exists()),
@@ -187,30 +216,10 @@ def local_git_repos():
         )
     except OSError:
         candidates = []
-    for folder in candidates:
-        branch = git_command(folder, ["branch", "--show-current"]).stdout.strip()
-        status = git_command(folder, ["status", "--porcelain"])
-        dirty = len([line for line in status.stdout.splitlines() if line.strip()])
-        upstream_result = git_command(folder, ["rev-parse", "--verify", "@{u}"])
-        upstream = upstream_result.stdout.strip() if upstream_result.returncode == 0 else ""
-        ahead = behind = 0
-        remote_url = git_command(folder, ["remote", "get-url", "origin"]).stdout.strip()
-        if upstream:
-            counts = git_command(folder, ["rev-list", "--left-right", "--count", f"HEAD...{upstream}"])
-            if counts.returncode == 0 and counts.stdout.strip():
-                parts = counts.stdout.strip().split()
-                if len(parts) == 2:
-                    ahead, behind = int(parts[0]), int(parts[1])
-        entries.append({
-            "key": str(folder),
-            "name": folder.name,
-            "branch": branch or "(detached)",
-            "dirty": dirty,
-            "ahead": ahead,
-            "behind": behind,
-            "remote": remote_url,
-        })
-    return entries
+    if not candidates:
+        return []
+    with ThreadPoolExecutor(max_workers=min(16, len(candidates))) as pool:
+        return list(pool.map(_local_repo_status, candidates))
 
 
 def github_clone_or_checkout(owner, repo, branch, token):
