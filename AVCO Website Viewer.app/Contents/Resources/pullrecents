@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+
+# Find every Git repository one level below the current directory, including
+# folders cloned since the previous run, then pull each repository in turn.
+
+shopt -s nullglob
+
+if [[ -t 1 ]]; then
+  bold='\033[1m'
+  green='\033[32m'
+  yellow='\033[33m'
+  red='\033[31m'
+  cyan='\033[36m'
+  reset='\033[0m'
+else
+  bold=''
+  green=''
+  yellow=''
+  red=''
+  cyan=''
+  reset=''
+fi
+
+repositories=()
+
+printf '%bScanning for Git repositories...%b\n' "$cyan" "$reset"
+
+for folder in */; do
+  [[ -d "$folder" ]] || continue
+
+  if git -C "$folder" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    repositories+=("${folder%/}")
+  fi
+done
+
+total=${#repositories[@]}
+
+if (( total == 0 )); then
+  printf '%bNo Git repositories found in immediate subfolders of %s.%b\n' \
+    "$yellow" "$PWD" "$reset"
+  exit 0
+fi
+
+printf '%bFound %d repositories. Updating them now.%b\n\n' \
+  "$bold" "$total" "$reset"
+
+completed=0
+succeeded=0
+failed=0
+bar_width=24
+
+draw_progress() {
+  local current=$1
+  local label=${2:-Updating repositories}
+  local filled=$((current * bar_width / total))
+  local empty=$((bar_width - filled))
+  local bar=''
+  local i
+
+  for ((i = 0; i < filled; i++)); do bar+='█'; done
+  for ((i = 0; i < empty; i++)); do bar+='░'; done
+
+  if [[ -t 1 ]]; then
+    printf '\r\033[K%b[%s] %d/%d completed%b  %s' \
+      "$cyan" "$bar" "$current" "$total" "$reset" "$label"
+  fi
+}
+
+draw_progress 0
+
+for repository in "${repositories[@]}"; do
+  draw_progress "$completed" "Updating $repository…"
+
+  pull_output=$(git -C "$repository" pull 2>&1)
+  if (( $? == 0 )); then
+    succeeded=$((succeeded + 1))
+  else
+    failed=$((failed + 1))
+    if [[ -t 1 ]]; then printf '\r\033[K'; fi
+    printf '%b✗ %s failed%b\n%s\n' "$red" "$repository" "$reset" "$pull_output" >&2
+  fi
+
+  completed=$((completed + 1))
+  draw_progress "$completed" "Finished $repository"
+done
+
+if [[ -t 1 ]]; then printf '\n'; fi
+printf '\n%bDone: %d/%d completed — %d updated, %d failed.%b\n' \
+  "$bold" "$completed" "$total" "$succeeded" "$failed" "$reset"
+
+(( failed == 0 ))

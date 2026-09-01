@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""Mouse-friendly local website launcher for projects in the current folder."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import shutil
+import secrets
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+DEFAULT_ROOT = Path.cwd().resolve()
+SETTINGS_PATH = Path.home() / ".avco-website-viewer.json"
+ROOT = DEFAULT_ROOT
+REFRESH_MS = 10000
+RUNNING: dict[str, dict] = {}
+FAILURES: dict[str, dict] = {}
+BUILDS: dict[str, dict] = {}
+PREFLIGHTS: dict[str, dict] = {}
+LOCK = threading.Lock()
+
+
+def load_settings():
+    global ROOT, REFRESH_MS
+    try:
+        saved = json.loads(SETTINGS_PATH.read_text())
+    except (OSError, ValueError):
+        return
+    root_value = saved.get("root")
+    if root_value:
+        candidate = Path(root_value).expanduser()
+        if candidate.is_dir():
+            ROOT = candidate.resolve()
+    refresh_value = saved.get("refresh_ms")
+    if isinstance(refresh_value, int) and 2000 <= refresh_value <= 120000:
+        REFRESH_MS = refresh_value
+
+
+def save_settings():
+    try:
+        SETTINGS_PATH.write_text(json.dumps({"root": str(ROOT), "refresh_ms": REFRESH_MS}))
+    except OSError:
+        pass
+
+
+def latest_change(folder: Path):
+    latest = folder.stat().st_mtime
+    checked = 0
+    excluded = {".git", "node_modules", ".next", "dist", "build", ".cache"}
+    try:
+        for current, directories, files in os.walk(folder):
+            directories[:] = [name for name in directories if name not in excluded and not name.startswith(".")]
+            for name in files:
+                try:
+                    latest = max(latest, (Path(current) / name).stat().st_mtime)
+                except OSError:
+                    pass
+                checked += 1
+                if checked >= 2000:
+                    return latest
+    except OSError:
+        pass
+    return latest
+
+
+def project_command(folder: Path, port: int | None = None):
+    package = folder / "package.json"
+    if package.is_file():
+        try:
+            package_data = json.loads(package.read_text())
+            scripts = package_data.get("scripts", {})
+        except (OSError, json.JSONDecodeError):
+            package_data = {}
+            scripts = {}
+
+        manager = "npm"
+        if (folder / "pnpm-lock.yaml").exists() and shutil.which("pnpm"):
+            manager = "pnpm"
+        elif (folder / "yarn.lock").exists() and shutil.which("yarn"):
+            manager = "yarn"
+        elif (folder / "bun.lockb").exists() and shutil.which("bun"):
+            manager = "bun"
+
+        for script in ("dev", "start", "serve", "preview"):
+            if script in scripts:
+                cmd = [manager, "run", script]
+                if port:
+                    script_text = str(scripts[script]).lower()
+                    dependencies = {
+                        **package_data.get("dependencies", {}),
+                        **package_data.get("devDependencies", {}),
+                    }
+                    if "next" in dependencies or "next " in script_text:
+                        cmd += ["--", "-H", "127.0.0.1", "-p", str(port)]
+                    elif any(name in dependencies for name in ("vite", "astro", "nuxt")):
+                        cmd += ["--", "--host", "127.0.0.1", "--port", str(port)]
+                    # Other frameworks receive PORT and HOST through their
+                    # environment instead of potentially incompatible flags.
+                return cmd, f"{manager} · {script}"
+
+    if (folder / "index.html").is_file():
+        cmd = [sys.executable, "-m", "http.server"]
+        if port:
+            cmd += [str(port), "--bind", "127.0.0.1"]
+        return cmd, "Static HTML"
+
+    return None
+
+
+def discover():
+    candidates = [ROOT]
+    try:
+        candidates += sorted(
+            (item for item in ROOT.iterdir() if item.is_dir() and not item.name.startswith(".")),
+            key=lambda item: item.name.lower(),
+        )
+    except OSError:
+        pass
+
+    projects = []
+    for folder in candidates:
+        details = project_command(folder)
+        if not details:
+            continue
+        _, kind = details
+        key = str(folder)
+        running = RUNNING.get(key)
+        if running and running["process"].poll() is not None:
+            RUNNING.pop(key, None)
+            running = None
+        projects.append(
+            {
+                "key": key,
+                "name": folder.name if folder != ROOT else f"{folder.name} (current folder)",
+                "path": str(folder),
+                "kind": kind,
+                "git": (folder / ".git").exists(),
+                "npm": (folder / "package.json").is_file(),
+                "modified": latest_change(folder),
+                "error": FAILURES.get(key, {}).get("message", ""),
+                "building": BUILDS.get(key, {}).get("status") == "running",
+                "running": bool(running),
+                "url": running["url"] if running else "",
+            }
+        )
+    return sorted(projects, key=lambda project: (project["npm"], project["name"].lower()))
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def valid_project(raw_path: str):
+    folder = Path(raw_path).resolve()
+    if folder != ROOT and folder.parent != ROOT:
+        return None
+    return folder if project_command(folder) else None
+
+
+def start_project(folder: Path, port_attempt: int = 0):
+    key = str(folder)
+
+    def fail(message, log_path, log=None):
+        if log and not log.closed:
+            log.close()
+        FAILURES[key] = {"message": message, "log_path": str(log_path), "time": time.time()}
+        return None, message
+
+    with LOCK:
+        existing = RUNNING.get(key)
+        if existing and existing["process"].poll() is None:
+            return existing["url"], None
+
+        port = free_port()
+        command, _ = project_command(folder, port)
+        log_path = Path("/tmp") / f"website-viewer-{abs(hash(key))}-{port_attempt}.log"
+        log = log_path.open("a")
+        BUILDS.setdefault(key, {}).update({"log_path": str(log_path)})
+        log.write(f"\n--- Started {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        log.flush()
+
+        package = folder / "package.json"
+        if package.is_file() and not (folder / "node_modules").exists():
+            manager = command[0]
+            log.write("Installing missing website dependencies...\n")
+            log.flush()
+            try:
+                setup = subprocess.run(
+                    [manager, "install"],
+                    cwd=folder,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=300,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                log.write(f"Setup error: {exc}\n")
+                return fail("Website setup failed.", log_path, log)
+            if setup.returncode != 0:
+                return fail("Website setup failed.", log_path, log)
+
+        environment = os.environ.copy()
+        environment.update({"PORT": str(port), "HOST": "127.0.0.1", "BROWSER": "none"})
+
+        if package.is_file():
+            try:
+                scripts = json.loads(package.read_text()).get("scripts", {})
+            except (OSError, json.JSONDecodeError):
+                scripts = {}
+            if "build" in scripts:
+                log.write("Building website...\n")
+                log.flush()
+                try:
+                    build = subprocess.run(
+                        [command[0], "run", "build"],
+                        cwd=folder,
+                        env=environment,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        timeout=300,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    log.write(f"Build error: {exc}\n")
+                    return fail("Website build failed.", log_path, log)
+                if build.returncode != 0:
+                    return fail("Website build failed.", log_path, log)
+
+        process = subprocess.Popen(
+            command,
+            cwd=folder,
+            env=environment,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        url = f"http://localhost:{port}"
+        RUNNING[key] = {"process": process, "url": url, "log": log, "log_path": log_path}
+        FAILURES.pop(key, None)
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if process.poll() is not None:
+            RUNNING.pop(key, None)
+            log.flush()
+            try:
+                recent_output = log_path.read_text(errors="replace")[-12000:].lower()
+            except OSError:
+                recent_output = ""
+            port_conflict = any(marker in recent_output for marker in (
+                "eaddrinuse", "address already in use", "port is already in use",
+                "port already in use", "port is in use",
+            ))
+            if port_conflict and port_attempt < 4:
+                log.write(f"\nPort {port} is occupied. Retrying automatically on another port...\n")
+                log.flush()
+                log.close()
+                return start_project(folder, port_attempt + 1)
+            return fail("The website server did not start.", log_path, log)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                break
+        except OSError:
+            time.sleep(0.2)
+    return url, None
+
+
+def start_project_async(folder: Path):
+    key = str(folder)
+    if BUILDS.get(key, {}).get("status") == "running":
+        return False
+    BUILDS[key] = {"status": "running", "message": "Preparing build…", "url": ""}
+
+    def work():
+        url, error = start_project(folder)
+        BUILDS[key].update({
+            "status": "failed" if error else "complete",
+            "message": error or "Website is live.",
+            "url": url or "",
+        })
+
+    threading.Thread(target=work, daemon=True).start()
+    return True
+
+
+def stop_project(folder: Path):
+    with LOCK:
+        item = RUNNING.pop(str(folder), None)
+    if not item:
+        return
+    process = item["process"]
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    item["log"].close()
+
+
+def stop_all_projects():
+    folders = list(RUNNING)
+    for folder in folders:
+        stop_project(Path(folder))
+    return len(folders)
+
+
+def pull_project(folder: Path):
+    if not (folder / ".git").exists():
+        return False, "This website is not connected to a Git repository."
+    try:
+        result = subprocess.run(
+            ["git", "pull"],
+            cwd=folder,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Pull failed: {exc}"
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        if "already up to date" in output.lower():
+            return True, "Already up to date."
+        return True, "Latest changes pulled successfully."
+    final_line = output.splitlines()[-1] if output else "Git pull failed."
+    return False, final_line
+
+
+def git_command(folder: Path, arguments, timeout=120):
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    return subprocess.run(
+        ["git", *arguments], cwd=folder, capture_output=True, text=True,
+        timeout=timeout, env=environment,
+    )
+
+
+def push_preflight(folder: Path):
+    if not (folder / ".git").exists():
+        return False, "This website is not connected to Git.", None
+    try:
+        conflicts = git_command(folder, ["diff", "--name-only", "--diff-filter=U"])
+        if conflicts.stdout.strip():
+            return False, "Resolve the existing merge conflicts before pushing.", None
+        fetched = git_command(folder, ["fetch", "--all", "--prune"])
+        if fetched.returncode != 0:
+            return False, (fetched.stderr.strip().splitlines() or ["Unable to fetch the remote."])[-1], None
+        head = git_command(folder, ["rev-parse", "HEAD"]).stdout.strip()
+        upstream_result = git_command(folder, ["rev-parse", "--verify", "@{u}"])
+        upstream = upstream_result.stdout.strip() if upstream_result.returncode == 0 else ""
+        if upstream:
+            safe = git_command(folder, ["merge-base", "--is-ancestor", upstream, "HEAD"])
+            if safe.returncode != 0:
+                return False, "The remote has newer changes. Pull Latest before committing and pushing.", None
+        branch = git_command(folder, ["branch", "--show-current"]).stdout.strip()
+        if not branch:
+            return False, "This repository is not currently on a branch.", None
+        status = git_command(folder, ["status", "--porcelain"])
+        changed = len([line for line in status.stdout.splitlines() if line.strip()])
+        ahead = 0
+        if upstream:
+            count = git_command(folder, ["rev-list", "--count", f"{upstream}..HEAD"])
+            if count.returncode == 0:
+                ahead = int(count.stdout.strip() or "0")
+        token = secrets.token_urlsafe(24)
+        PREFLIGHTS[token] = {
+            "folder": str(folder), "head": head, "upstream": upstream,
+            "branch": branch, "not_before": time.time() + 3, "expires": time.time() + 120,
+        }
+        return True, "Remote check passed.", {"token": token, "changed": changed, "ahead": ahead, "branch": branch}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Git safety check failed: {exc}", None
+
+
+def commit_and_push(folder: Path, token: str, message: str):
+    check = PREFLIGHTS.pop(token, None)
+    if not check or check["folder"] != str(folder) or check["expires"] < time.time():
+        return False, "The safety check expired. Please check again."
+    if time.time() < check["not_before"]:
+        return False, "The three-second confirmation was not completed. Nothing was pushed."
+    if not message.strip():
+        return False, "Enter a commit message before pushing."
+    try:
+        head = git_command(folder, ["rev-parse", "HEAD"]).stdout.strip()
+        if head != check["head"]:
+            return False, "The repository changed after the safety check. Please check again."
+        fetched = git_command(folder, ["fetch", "--all", "--prune"])
+        if fetched.returncode != 0:
+            return False, "The remote could not be rechecked. Nothing was pushed."
+        if check["upstream"]:
+            upstream_now = git_command(folder, ["rev-parse", "--verify", "@{u}"]).stdout.strip()
+            if upstream_now != check["upstream"]:
+                return False, "The remote changed during confirmation. Nothing was pushed."
+        git_command(folder, ["add", "-A"])
+        staged = git_command(folder, ["diff", "--cached", "--quiet"])
+        if staged.returncode != 0:
+            committed = git_command(folder, ["commit", "-m", message.strip()])
+            if committed.returncode != 0:
+                detail = (committed.stderr + committed.stdout).strip().splitlines()
+                return False, detail[-1] if detail else "The commit failed."
+        elif not check["upstream"]:
+            return False, "There are no changes to commit."
+        if check["upstream"]:
+            pushed = git_command(folder, ["push"])
+        else:
+            pushed = git_command(folder, ["push", "-u", "origin", check["branch"]])
+        if pushed.returncode != 0:
+            detail = (pushed.stderr + pushed.stdout).strip().splitlines()
+            return False, (detail[-1] if detail else "Push failed.") + " The commit remains local."
+        return True, "Changes committed and pushed successfully."
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Commit or push failed: {exc}"
+
+
+def project_logs(folder: Path):
+    key = str(folder)
+    failure = BUILDS.get(key) or FAILURES.get(key)
+    if not failure or not failure.get("log_path"):
+        return "Waiting for build output…"
+    try:
+        content = Path(failure["log_path"]).read_text(errors="replace")
+    except OSError as exc:
+        return f"Unable to read the log: {exc}"
+    return content[-50000:] or "The log is empty."
+
+
+def build_status(folder: Path):
+    build = BUILDS.get(str(folder), {"status": "idle", "message": "No build has run yet.", "url": ""})
+    return {"status": build.get("status", "idle"), "message": build.get("message", ""), "url": build.get("url", ""), "log": project_logs(folder)}
+
+
+PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Website Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700;800&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+:root { color-scheme:dark; --ink:#eef5ee; --muted:#93ab97; --panel:#0d1f14; --line:#284a34; --lime:#8fe6a8; --deep:#08120c; --mint:#c7ecc9; --paper:#0f2317; --accent:#5fd487; }
+* { box-sizing:border-box }
+body { margin:0; background:var(--deep); color:var(--ink); font:16px/1.65 "Lora",Georgia,serif; min-height:100vh; overflow-x:hidden; }
+body:before { content:""; position:fixed; inset:0; pointer-events:none; background-image:linear-gradient(#ffffff04 1px,transparent 1px),linear-gradient(90deg,#ffffff04 1px,transparent 1px); background-size:64px 64px; mask-image:linear-gradient(to bottom,#000 0,transparent 70%); }
+main { position:relative; width:min(1080px,calc(100% - 40px)); margin:0 auto; padding:40px 0 90px; }
+h1,h2,h3,.brand,button,.button,.eyebrow,.type,.badge,.toolbar h3 { font-family:"Poppins",Arial,sans-serif; }
+.nav { display:flex; align-items:center; justify-content:space-between; padding:6px 0 44px; animation:rise .6s ease both; }
+.brand { display:flex; align-items:center; gap:12px; font-weight:700; letter-spacing:.01em; }
+.mark { width:36px; height:36px; display:grid; place-items:center; border-radius:9px; color:var(--deep); background:var(--accent); font-size:11px; font-weight:800; letter-spacing:.03em; }
+.nav-status { display:flex; align-items:center; gap:9px; color:var(--muted); font-size:13px; font-family:"Lora",Georgia,serif; font-style:italic; }.pulse { width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px #5fd48722; }
+header { display:grid; grid-template-columns:1.5fr .7fr; gap:36px; align-items:end; margin-bottom:34px; padding:0 0 34px; border-bottom:1px solid var(--line); position:relative; animation:rise .7s .05s ease both; }
+.eyebrow { color:var(--accent); font-size:11px; font-weight:700; letter-spacing:.18em; text-transform:uppercase; }
+h1 { margin:10px 0 0; font-weight:700; font-size:clamp(38px,5.6vw,60px); line-height:1.02; letter-spacing:-.02em; }
+.sub { color:var(--muted); margin:18px 0 0; max-width:560px; font-size:17px; }
+.stats { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+.stat { padding:16px 10px; border-radius:4px; background:var(--paper); border:1px solid var(--line); text-align:center; border-left:2px solid var(--accent); }.stat strong { display:block; font-family:"Poppins",Arial,sans-serif; font-size:26px; font-weight:700; letter-spacing:-.02em; }.stat span { color:var(--muted); font-size:10px; letter-spacing:.12em; text-transform:uppercase; }
+button,.button { border:0; border-radius:8px; cursor:pointer; padding:11px 18px; font:600 14px "Poppins",Arial,sans-serif; text-decoration:none; display:inline-flex; align-items:center; justify-content:center; letter-spacing:.01em; transition:.15s ease; }
+.toolbar { display:flex; justify-content:space-between; align-items:center; margin:0 2px 14px; gap:12px }.toolbar h3 { margin:0; font-size:12px; font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }.toolbar-actions{display:flex;gap:8px}.logs-tab{color:var(--ink);background:var(--paper);border:1px solid var(--line)}.logs-tab.has-error{color:#ffd9d9;background:#3a1c1f;border-color:#6b3238}.logs-tab.active{box-shadow:0 0 0 2px #5fd48755}
+.filters{display:grid;grid-template-columns:minmax(220px,1fr) 200px;gap:10px;margin:0 2px 20px}.search-wrap{position:relative}.search-wrap:before{content:"⌕";position:absolute;left:15px;top:11px;color:var(--accent);font-size:18px}.search,.sort{width:100%;height:44px;border-radius:8px;border:1px solid var(--line);background:var(--paper);color:var(--ink);font:15px "Lora",Georgia,serif;outline:none;transition:.2s}.search{padding:0 15px 0 42px}.sort{padding:0 13px}.search:focus,.sort:focus{border-color:var(--accent)}.search::placeholder{color:var(--muted)}
+.refresh { color:var(--deep); background:var(--accent); white-space:nowrap; }.refresh:hover{filter:brightness(1.08)}.close-all{color:#ffdfe2;background:#3a1c1f;border:1px solid #6b3238}.close-all:hover{background:#4a2226}
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(288px,1fr)); gap:16px; }
+.card { position:relative; background:var(--paper); border:1px solid var(--line); border-radius:10px; padding:22px; min-height:224px; display:flex; flex-direction:column; transition:.2s ease; overflow:hidden; animation:rise .5s ease both; }
+.card:hover { border-color:var(--accent); transform:translateY(-2px); }
+.top { display:flex; justify-content:space-between; gap:12px; align-items:start; }
+.identity { display:flex;gap:12px;align-items:center;min-width:0 }.project-icon { flex:0 0 40px;width:40px;height:40px;border-radius:8px;display:grid;place-items:center;background:#16321f;border:1px solid var(--line);color:var(--accent);font-weight:700;font-family:"Poppins",Arial,sans-serif;font-size:16px }.identity-text{min-width:0}
+h2 { font-size:19px; font-weight:600; line-height:1.2; margin:0; letter-spacing:-.01em; overflow-wrap:anywhere; }
+.type { color:var(--muted);font-size:11px;margin-top:4px;font-weight:500 }
+.badge { color:var(--muted); background:#16321f; border:1px solid var(--line); border-radius:5px; padding:4px 9px; font-size:11px; font-weight:600; white-space:nowrap; }
+.badge.live { color:var(--deep); background:var(--accent); border-color:var(--accent); }
+.path { color:var(--muted); font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; margin:18px 0 22px; padding:9px 11px; border-radius:6px; background:var(--deep); border:1px solid var(--line); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:auto; }
+.run { background:var(--mint); color:var(--deep); flex:1; }.open { background:var(--accent); color:var(--deep); flex:1; overflow:hidden;text-overflow:ellipsis;white-space:nowrap }.stop { color:var(--ink); background:#16321f; border:1px solid var(--line); }.pull { color:var(--ink); background:#16321f; border:1px solid var(--line); }.run:hover,.open:hover,.pull:hover,.stop:hover{filter:brightness(1.1)} button:disabled{opacity:.5;cursor:wait}
+.push { color:var(--ink);background:#1c3826;border:1px solid var(--line) }.push:hover{background:#22432d}
+.empty { border:1px dashed var(--line); background:var(--paper); border-radius:10px; padding:52px 24px; text-align:center; color:var(--muted); }
+.toast { position:fixed; right:20px; bottom:20px; background:var(--accent); color:var(--deep); padding:13px 18px; border-radius:8px; font:600 14px "Poppins",Arial,sans-serif; box-shadow:0 18px 50px #0008; opacity:0; transform:translateY(10px); pointer-events:none; transition:.2s; }
+.toast.show { opacity:1; transform:none; }
+.modal-backdrop{display:none;position:fixed;inset:0;z-index:20;background:#000c;backdrop-filter:blur(8px);padding:24px;align-items:center;justify-content:center}.modal-backdrop.active{display:flex}.modal{width:min(560px,100%);border-radius:14px;border:1px solid var(--line);background:var(--paper);padding:28px;box-shadow:0 35px 100px #000}.modal h2{font-family:"Poppins",Arial,sans-serif;font-size:26px;font-weight:700;margin:0 0 8px}.modal p{color:var(--muted)}.commit-message{width:100%;height:48px;border-radius:8px;border:1px solid var(--line);background:var(--deep);color:var(--ink);padding:0 14px;font:15px "Lora",Georgia,serif;margin:12px 0 18px}.settings-label{display:block;font:600 12px "Poppins",Arial,sans-serif;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px}.cancel{background:#16321f;color:var(--ink);border:1px solid var(--line)}.safety-check{background:var(--accent);color:var(--deep)}.confirm-stage{display:none}.confirm-stage.active{display:block}.compose-stage.hidden{display:none}.warning-title{color:#ffb2b8;text-align:center;font-size:23px!important;text-transform:uppercase;letter-spacing:.02em}.push-summary{padding:14px;border-radius:8px;background:var(--deep);border:1px solid var(--line);margin:16px 0;color:var(--ink);font-family:"Lora",Georgia,serif}.hold-push{position:relative;width:100%;height:66px;border-radius:10px;overflow:hidden;background:#7a1f28;color:white;font-size:16px;letter-spacing:.02em;user-select:none;-webkit-user-select:none}.hold-push .hold-progress{position:absolute;inset:0 auto 0 0;width:0;background:#a5202d;pointer-events:none}.hold-push .hold-label{position:relative;z-index:1}.hold-push.holding{transform:scale(.99)}
+.logs-panel { display:none; }.logs-panel.active { display:block; }.grid.hidden,.filters.hidden{display:none}.console-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:14px}.console-head h2{font-size:20px;font-weight:700}.console-status{color:var(--accent);font-size:13px;font-family:"Lora",Georgia,serif;font-style:italic}.console-actions{display:flex;gap:8px}.log-card{background:var(--paper);border:1px solid #6b3238;border-radius:10px;padding:22px;margin-bottom:14px}.log-card h2{color:#ffd4d7;margin-bottom:6px}.log-error{color:#ff9ca6;font-weight:600;margin-bottom:14px;font-family:"Lora",Georgia,serif}.log-output{margin:0;height:min(55vh,520px);overflow:auto;padding:18px;border-radius:8px;background:var(--deep);border:1px solid var(--line);color:#bfe8c4;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}.logs-empty{color:var(--muted);padding:40px;text-align:center;border:1px dashed var(--line);border-radius:10px;font-style:italic}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.card:nth-child(1){animation-delay:.02s}.card:nth-child(2){animation-delay:.06s}.card:nth-child(3){animation-delay:.1s}.card:nth-child(4){animation-delay:.14s}.card:nth-child(5){animation-delay:.18s}.card:nth-child(6){animation-delay:.22s}
+@media(max-width:720px){ main{padding-top:20px}.nav{padding-bottom:24px}header{grid-template-columns:1fr;padding-bottom:26px}.stats{margin-top:10px}.toolbar{gap:12px;align-items:flex-start}.toolbar-actions{flex-wrap:wrap;justify-content:flex-end}.filters{grid-template-columns:1fr}.refresh{padding-inline:14px}.grid{grid-template-columns:1fr} }
+</style></head>
+<body><main><nav class="nav"><div class="brand"><div class="mark">AVCO</div><span>Website Operations</span></div><div class="nav-status"><i class="pulse"></i>Local workspace connected</div></nav><header><div><div class="eyebrow">Development command center</div><h1>Website Viewer</h1><p class="sub">Build, launch, update, and inspect every AVCO website from one focused workspace.</p></div><div class="stats"><div class="stat"><strong id="total">–</strong><span>Projects</span></div><div class="stat"><strong id="live">–</strong><span>Live</span></div><div class="stat"><strong id="npm">–</strong><span>npm</span></div></div></header><div class="toolbar"><h3>Projects in <span id="rootLabel">__ROOT__</span></h3><div class="toolbar-actions"><button id="settingsTab" class="logs-tab" onclick="openSettings()" aria-label="Settings">⚙ Settings</button><button id="logsTab" class="logs-tab" onclick="showLogs()">Build console</button><button class="refresh" onclick="load()">Refresh</button></div></div><div id="filters" class="filters"><label class="search-wrap"><input id="search" class="search" type="search" placeholder="Search websites…" oninput="renderProjects()" aria-label="Search websites"></label><select id="sort" class="sort" onchange="renderProjects()" aria-label="Sort websites"><option value="recent">Recently changed</option><option value="alpha">Alphabetical A–Z</option><option value="live">Live websites first</option><option value="type">Website type</option></select></div><section id="grid" class="grid"></section><section id="logsPanel" class="logs-panel"></section></main><div class="toast" id="toast"></div><div id="pushModal" class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal"><div id="composeStage" class="compose-stage"><h2>Commit & Push</h2><p id="pushProject"></p><input id="commitMessage" class="commit-message" placeholder="Describe your changes…" maxlength="180"><div class="modal-actions"><button class="cancel" onclick="closePushModal()">Cancel</button><button id="checkPush" class="safety-check" onclick="checkPushSafety()">Check remote safety</button></div></div><div id="confirmStage" class="confirm-stage"><h2 class="warning-title">Are you sure you would like to push?</h2><div id="pushSummary" class="push-summary"></div><p style="text-align:center">Hold the red button continuously for three seconds. Releasing early cancels the push.</p><button id="holdPush" class="hold-push"><span class="hold-progress"></span><span class="hold-label">YES — HOLD 3 SECONDS TO PUSH</span></button><div class="modal-actions" style="margin-top:12px"><button class="cancel" onclick="closePushModal()">Cancel</button></div></div></div></div><div id="settingsModal" class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal"><h2>Settings</h2><p>Choose which folder Website Viewer scans, and how often the dashboard refreshes.</p><label class="settings-label" for="rootInput">Website folder</label><input id="rootInput" class="commit-message" placeholder="/Users/you/avco"><label class="settings-label" for="refreshInput">Auto-refresh</label><select id="refreshInput" class="sort" style="width:100%;margin:0 0 16px"><option value="5000">Every 5 seconds</option><option value="10000">Every 10 seconds</option><option value="30000">Every 30 seconds</option><option value="60000">Every minute</option><option value="0">Off</option></select><div class="modal-actions"><button class="cancel" onclick="closeSettings()">Cancel</button><button class="safety-check" onclick="saveSettings()">Save</button></div></div></div>
+<script>
+const grid=document.querySelector('#grid'), toast=document.querySelector('#toast'), logsPanel=document.querySelector('#logsPanel'), logsTab=document.querySelector('#logsTab');let latestProjects=[];
+function safe(s){const e=document.createElement('span');e.textContent=s;return e.innerHTML}
+function note(message){toast.textContent=message;toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),2600)}
+function cardMarkup(p){
+ const key=encodeURIComponent(p.key), state=encodeURIComponent(JSON.stringify([p.name,p.kind,p.git,p.npm,p.running,p.url,p.error]));
+ return `<article class="card" data-key="${key}" data-state="${state}"><div class="top"><div class="identity"><div class="project-icon">${safe(p.name.charAt(0).toUpperCase())}</div><div class="identity-text"><h2>${safe(p.name)}</h2><div class="type">${safe(p.kind)}${p.git?' · Git connected':''}</div></div></div><span class="badge ${p.running?'live':''}">${p.running?'● Live':(p.error?'! Build failed':'Ready')}</span></div><div class="path" title="${safe(p.path)}">${safe(p.path)}</div><div class="actions">${p.running?`<a class="button open" href="${p.url}" target="_blank">${safe(p.url)} ↗</a><button class="stop" onclick="stopSite('${key}')">Stop</button>`:`<button class="run" onclick="runSite('${key}',this)">${p.npm?'⚒ Build & run':'▶ Run locally'}</button>`}${p.error?`<button class="logs-tab" onclick="showLogs('${key}')">! View logs</button>`:''}<button class="pull" onclick="pullSite('${key}',this)">↓ Pull latest</button>${p.git?`<button class="push" onclick="openPushModal('${key}')">↑ Commit & Push</button>`:''}</div></article>`;
+}
+async function load(){
+ if(!grid.dataset.ready)grid.innerHTML='<div class="empty">Scanning your folders…</div>';
+ const projects=await fetch('/api/projects').then(r=>r.json());
+ latestProjects=projects;const failureCount=projects.filter(p=>p.error).length;logsTab.textContent=failureCount?`! Build console (${failureCount})`:'› Build console';logsTab.classList.toggle('has-error',failureCount>0);
+ document.querySelector('#total').textContent=projects.length;document.querySelector('#live').textContent=projects.filter(p=>p.running).length;document.querySelector('#npm').textContent=projects.filter(p=>p.npm).length;
+ renderProjects();
+}
+function renderProjects(){
+ const query=(document.querySelector('#search').value||'').trim().toLowerCase(), mode=document.querySelector('#sort').value;let projects=latestProjects.filter(p=>!query||p.name.toLowerCase().includes(query)||p.path.toLowerCase().includes(query)||p.kind.toLowerCase().includes(query));
+ projects.sort((a,b)=>{const liveFirst=b.running-a.running;if(liveFirst)return liveFirst;if(mode==='recent')return (a.npm-b.npm)||(b.modified-a.modified)||a.name.localeCompare(b.name);if(mode==='live')return (a.npm-b.npm)||a.name.localeCompare(b.name);if(mode==='type')return (a.npm-b.npm)||a.kind.localeCompare(b.kind)||a.name.localeCompare(b.name);return (a.npm-b.npm)||a.name.localeCompare(b.name)});
+ if(!projects.length){grid.innerHTML=`<div class="empty">${latestProjects.length?'No websites match your search.':'No website projects found yet.<br><small>Website Viewer recognizes common app projects and folders with an index.html file.</small>'}</div>`;grid.dataset.ready='1';return}
+ grid.querySelectorAll('.empty').forEach(item=>item.remove());
+ const existing=new Map([...grid.querySelectorAll('.card')].map(card=>[card.dataset.key,card]));
+ const wanted=new Set();
+ for(const project of projects){
+   const key=encodeURIComponent(project.key), state=encodeURIComponent(JSON.stringify([project.name,project.kind,project.git,project.npm,project.running,project.url,project.error]));
+   wanted.add(key);let card=existing.get(key);
+   if(!card||card.dataset.state!==state){const template=document.createElement('template');template.innerHTML=cardMarkup(project).trim();const replacement=template.content.firstElementChild;if(card)card.replaceWith(replacement);card=replacement}
+   grid.appendChild(card);
+ }
+ for(const [key,card] of existing)if(!wanted.has(key))card.remove();
+ grid.dataset.ready='1';
+}
+function showProjects(){logsPanel.classList.remove('active');grid.classList.remove('hidden');document.querySelector('#filters').classList.remove('hidden');logsTab.classList.remove('active')}
+async function showLogs(focusKey=''){grid.classList.add('hidden');document.querySelector('#filters').classList.add('hidden');logsPanel.classList.add('active');logsTab.classList.add('active');const failures=latestProjects.filter(p=>p.error);if(!failures.length){logsPanel.innerHTML='<div class="logs-empty">No build failures are currently recorded.</div>';return}logsPanel.innerHTML='<div class="logs-empty">Loading build logs…</div>';const cards=[];for(const p of failures){const key=encodeURIComponent(p.key);const response=await fetch('/api/logs?path='+key).then(r=>r.json());cards.push(`<article class="log-card" id="log-${key}"><h2>${safe(p.name)}</h2><div class="log-error">${safe(p.error)}</div><pre class="log-output">${safe(response.log)}</pre></article>`)}logsPanel.innerHTML=cards.join('');if(focusKey)document.querySelector('#log-'+CSS.escape(focusKey))?.scrollIntoView({behavior:'smooth'})}
+async function showBuildConsole(key){grid.classList.add('hidden');document.querySelector('#filters').classList.add('hidden');logsPanel.classList.add('active');logsTab.classList.add('active');const project=latestProjects.find(p=>encodeURIComponent(p.key)===key);logsPanel.innerHTML=`<div class="console-head"><div><h2>${safe(project?.name||'Website build')}</h2><div id="consoleStatus" class="console-status">Preparing build…</div></div><div class="console-actions"><button onclick="showProjects()">← Projects</button></div></div><pre id="liveOutput" class="log-output">Starting build process…</pre>`;await pollBuild(key)}
+async function pollBuild(key){const result=await fetch('/api/build-status?path='+key).then(r=>r.json()),output=document.querySelector('#liveOutput'),status=document.querySelector('#consoleStatus');if(!output)return;output.textContent=result.log;output.scrollTop=output.scrollHeight;status.textContent=result.status==='running'?'● Build running…':result.status==='complete'?'✓ Website is live':`! ${result.message}`;if(result.status==='running'){setTimeout(()=>pollBuild(key),450)}else{await load();if(result.status==='complete'&&result.url){document.querySelector('.console-actions')?.insertAdjacentHTML('afterbegin',`<a class="button open" href="${result.url}" target="_blank">Open ${result.url} ↗</a>`)}}}
+async function runSite(key,button){button.disabled=true;button.textContent='Opening console…';const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+key}).then(r=>r.json());if(r.error){note(r.error);button.disabled=false}else{showBuildConsole(key)}}
+async function stopSite(key){await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+key});note('Website stopped');await load()}
+async function closeAllSites(){const r=await fetch('/api/stop-all',{method:'POST'}).then(r=>r.json());note(r.count?`Closed ${r.count} website${r.count===1?'':'s'}`:'No websites are currently running');showProjects();await load()}
+async function pullSite(key,button){const old=button.textContent;button.disabled=true;button.textContent='Pulling…';const r=await fetch('/api/pull',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+key}).then(r=>r.json());note(r.message);button.disabled=false;button.textContent=old}
+let pushKey='',pushToken='',holdStart=0,holdFrame=0,pushing=false;
+function openPushModal(key){pushKey=key;pushToken='';pushing=false;const p=latestProjects.find(item=>encodeURIComponent(item.key)===key);document.querySelector('#pushProject').textContent=`${p?.name||'Website'} — all current changes will be staged.`;document.querySelector('#commitMessage').value='';document.querySelector('#composeStage').classList.remove('hidden');document.querySelector('#confirmStage').classList.remove('active');document.querySelector('#pushModal').classList.add('active');setTimeout(()=>document.querySelector('#commitMessage').focus(),80)}
+function closePushModal(){if(pushing)return;cancelHold();document.querySelector('#pushModal').classList.remove('active')}
+async function checkPushSafety(){const message=document.querySelector('#commitMessage').value.trim(),button=document.querySelector('#checkPush');if(!message){note('Enter a commit message first');return}button.disabled=true;button.textContent='Checking remote…';const response=await fetch('/api/push-preflight',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+pushKey}).then(async r=>({ok:r.ok,data:await r.json()}));button.disabled=false;button.textContent='Check remote safety';if(!response.ok){note(response.data.message);return}pushToken=response.data.details.token;const d=response.data.details;document.querySelector('#pushSummary').textContent=`Safety check passed · ${d.changed} changed file${d.changed===1?'':'s'} · ${d.ahead} local commit${d.ahead===1?'':'s'} ahead · branch ${d.branch}`;document.querySelector('#composeStage').classList.add('hidden');document.querySelector('#confirmStage').classList.add('active')}
+function beginHold(event){if(!pushToken||pushing)return;event.preventDefault();const button=document.querySelector('#holdPush');button.classList.add('holding');button.setPointerCapture?.(event.pointerId);holdStart=performance.now();const tick=now=>{const elapsed=now-holdStart,pct=Math.min(100,elapsed/30);button.querySelector('.hold-progress').style.width=pct+'%';button.querySelector('.hold-label').textContent=elapsed>=3000?'PUSHING…':`YES — KEEP HOLDING ${(3-elapsed/1000).toFixed(1)}s`;if(elapsed>=3000){holdFrame=0;commitPush();return}holdFrame=requestAnimationFrame(tick)};holdFrame=requestAnimationFrame(tick)}
+function cancelHold(){if(holdFrame)cancelAnimationFrame(holdFrame);holdFrame=0;holdStart=0;const button=document.querySelector('#holdPush');button.classList.remove('holding');button.querySelector('.hold-progress').style.width='0';button.querySelector('.hold-label').textContent='YES — HOLD 3 SECONDS TO PUSH'}
+async function commitPush(){if(pushing)return;pushing=true;const body=new URLSearchParams({path:pushKey,token:pushToken,message:document.querySelector('#commitMessage').value});const response=await fetch('/api/commit-push',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}).then(async r=>({ok:r.ok,data:await r.json()}));pushing=false;if(response.ok){document.querySelector('#pushModal').classList.remove('active');note(response.data.message);await load()}else{note(response.data.message);closePushModal()}}
+const holdButton=document.querySelector('#holdPush');holdButton.addEventListener('pointerdown',beginHold);holdButton.addEventListener('pointerup',cancelHold);holdButton.addEventListener('pointercancel',cancelHold);holdButton.addEventListener('pointerleave',event=>{if(event.buttons)cancelHold()});
+let currentSettings={root:'',refresh_ms:10000},refreshTimer=0;
+function armRefresh(){if(refreshTimer)clearInterval(refreshTimer);if(currentSettings.refresh_ms>0)refreshTimer=setInterval(load,currentSettings.refresh_ms)}
+async function loadSettings(){currentSettings=await fetch('/api/settings').then(r=>r.json());document.querySelector('#rootLabel').textContent=currentSettings.root;armRefresh()}
+function openSettings(){document.querySelector('#rootInput').value=currentSettings.root;document.querySelector('#refreshInput').value=String(currentSettings.refresh_ms);document.querySelector('#settingsModal').classList.add('active')}
+function closeSettings(){document.querySelector('#settingsModal').classList.remove('active')}
+async function saveSettings(){const root=document.querySelector('#rootInput').value.trim(),refresh_ms=Number(document.querySelector('#refreshInput').value);const response=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({root,refresh_ms})}).then(async r=>({ok:r.ok,data:await r.json()}));if(!response.ok){note(response.data.message||'Could not save settings');return}closeSettings();note('Settings saved');await loadSettings();await load()}
+loadSettings(); load();
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def send_content(self, status, content, content_type="application/json"):
+        body = content.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/projects":
+            self.send_content(200, json.dumps(discover()))
+        elif parsed.path == "/api/logs":
+            data = urllib.parse.parse_qs(parsed.query)
+            folder = valid_project(data.get("path", [""])[0])
+            if not folder:
+                self.send_content(400, json.dumps({"error": "Website not available"}))
+            else:
+                self.send_content(200, json.dumps({"log": project_logs(folder)}))
+        elif parsed.path == "/api/build-status":
+            data = urllib.parse.parse_qs(parsed.query)
+            folder = valid_project(data.get("path", [""])[0])
+            if not folder:
+                self.send_content(400, json.dumps({"error": "Website not available"}))
+            else:
+                self.send_content(200, json.dumps(build_status(folder)))
+        elif parsed.path == "/api/settings":
+            self.send_content(200, json.dumps({"root": str(ROOT), "refresh_ms": REFRESH_MS}))
+        elif parsed.path == "/":
+            page = PAGE.replace("__ROOT__", html.escape(str(ROOT)))
+            self.send_content(200, page, "text/html")
+        else:
+            self.send_content(404, json.dumps({"error": "Not found"}))
+
+    def do_POST(self):
+        if self.path == "/api/stop-all":
+            count = stop_all_projects()
+            self.send_content(200, json.dumps({"ok": True, "count": count}))
+            return
+        if self.path == "/api/settings":
+            length = int(self.headers.get("Content-Length", "0"))
+            data = urllib.parse.parse_qs(self.rfile.read(length).decode())
+            global ROOT, REFRESH_MS
+            root_value = data.get("root", [""])[0].strip()
+            refresh_value = data.get("refresh_ms", [""])[0].strip()
+            if root_value:
+                candidate = Path(root_value).expanduser()
+                if not candidate.is_dir():
+                    self.send_content(400, json.dumps({"ok": False, "message": "That folder does not exist."}))
+                    return
+                ROOT = candidate.resolve()
+            if refresh_value:
+                try:
+                    parsed_refresh = int(refresh_value)
+                except ValueError:
+                    self.send_content(400, json.dumps({"ok": False, "message": "Invalid refresh interval."}))
+                    return
+                if parsed_refresh != 0 and not (2000 <= parsed_refresh <= 120000):
+                    self.send_content(400, json.dumps({"ok": False, "message": "Refresh interval must be 0 or between 2 and 120 seconds."}))
+                    return
+                REFRESH_MS = parsed_refresh
+            save_settings()
+            self.send_content(200, json.dumps({"ok": True, "root": str(ROOT), "refresh_ms": REFRESH_MS}))
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        data = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        folder = valid_project(data.get("path", [""])[0])
+        if not folder:
+            self.send_content(400, json.dumps({"error": "That website is not available."}))
+            return
+        if self.path == "/api/start":
+            started = start_project_async(folder)
+            self.send_content(200, json.dumps({"started": started, "error": None}))
+        elif self.path == "/api/stop":
+            stop_project(folder)
+            self.send_content(200, json.dumps({"ok": True}))
+        elif self.path == "/api/pull":
+            ok, message = pull_project(folder)
+            self.send_content(200 if ok else 400, json.dumps({"ok": ok, "message": message}))
+        elif self.path == "/api/push-preflight":
+            ok, message, details = push_preflight(folder)
+            self.send_content(200 if ok else 400, json.dumps({"ok": ok, "message": message, "details": details}))
+        elif self.path == "/api/commit-push":
+            ok, message = commit_and_push(folder, data.get("token", [""])[0], data.get("message", [""])[0])
+            self.send_content(200 if ok else 400, json.dumps({"ok": ok, "message": message}))
+        else:
+            self.send_content(404, json.dumps({"error": "Not found"}))
+
+    def log_message(self, *_):
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Browse and run local website projects.")
+    parser.add_argument("--check", action="store_true", help="list detected websites and exit")
+    parser.add_argument("--no-open", action="store_true", help="do not open the browser automatically")
+    parser.add_argument("--port", type=int, default=0, help="use a specific dashboard port")
+    args = parser.parse_args()
+    load_settings()
+    if args.check:
+        print(json.dumps(discover(), indent=2))
+        return
+
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    url = f"http://127.0.0.1:{server.server_port}"
+    print(f"Website Viewer is open at {url}", flush=True)
+    print("Press Control-C when you are finished.", flush=True)
+    if not args.no_open:
+        threading.Timer(0.35, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for folder in list(RUNNING):
+            stop_project(Path(folder))
+        server.server_close()
+        print("\nWebsite Viewer closed.")
+
+
+if __name__ == "__main__":
+    main()
